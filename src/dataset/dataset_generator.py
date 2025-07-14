@@ -16,24 +16,45 @@ import dataset.trajectory_sampler as ts
 # 0. 출력 루트 디렉터리 정의  (…/data/synthetic)
 # ──────────────────────────────────────────────────────────
 ROOT_DIR  = Path(__file__).resolve().parents[2]     # 프로젝트 루트
-DATA_DIR  = ROOT_DIR / "data" / "synthetic"
+DATA_DIR  = ROOT_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)         # 없으면 생성
 
 
 # ──────────────────────────────────────────────────────────
 # 1. 단일 샘플 생성
 # ──────────────────────────────────────────────────────────
-def make_sample(rng: np.random.Generator):
+# def make_sample(rng: np.random.Generator):
+#     rng = rng or np.random.default_rng()
+
+#     n_src = int(rng.integers(gt.N_SOURCES_RANGE[0],
+#                              gt.N_SOURCES_RANGE[1] + 1))
+#     coords, amps, sigmas = gt.sample_sources(gt.GRID, n_src)
+#     field = gt.gaussian_field(gt.GRID, coords, amps, sigmas).astype(np.float32)
+
+#     waypoints      = ts.generate_waypoints()
+#     r_meas, mask   = ts.sparse_from_waypoints(field, waypoints)
+#     return field, r_meas.astype(np.float32), mask.astype(np.uint8)
+
+def make_sample(rng: np.random.Generator | None = None):
     rng = rng or np.random.default_rng()
 
+    # 1) Ground-truth 필드 생성 (256×256)
     n_src = int(rng.integers(gt.N_SOURCES_RANGE[0],
                              gt.N_SOURCES_RANGE[1] + 1))
     coords, amps, sigmas = gt.sample_sources(gt.GRID, n_src)
     field = gt.gaussian_field(gt.GRID, coords, amps, sigmas).astype(np.float32)
 
-    waypoints      = ts.generate_waypoints()
-    r_meas, mask   = ts.sparse_from_waypoints(field, waypoints)
-    return field, r_meas.astype(np.float32), mask.astype(np.uint8)
+    # 2) 0-to-1 정규화 (★ 추가)
+    f_max = field.max() + 1e-6          # 0 방지용 ε
+    field /= f_max
+
+    # 3) sparse 측정치 추출 → r_meas / mask
+    waypoints = ts.generate_waypoints()
+    r_meas, mask = ts.sparse_from_waypoints(field, waypoints)
+    r_meas = r_meas.astype(np.float32)     # 같은 스케일
+    mask   = mask.astype(np.uint8)
+
+    return field, r_meas, mask                      # 모두 (H,W)
 
 
 # ──────────────────────────────────────────────────────────
@@ -88,8 +109,9 @@ class RadiationDataset(Dataset):
 # 4. 직접 실행 예시
 # ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    generate_dataset(num_samples=1800, split="train")
-    generate_dataset(num_samples= 200, split="val")
+    generate_dataset(num_samples= 9000, split="train")
+    generate_dataset(num_samples= 1000, split="val")
+    generate_dataset(num_samples= 200, split="test")
 
     # DataLoader 사용법
     # train_loader = DataLoader(RadiationDataset("train"),
