@@ -1,139 +1,148 @@
+# ──────────────────────────────────────────────────────────────
+# dataset/trajectory_sampler.py
+# ──────────────────────────────────────────────────────────────
+from __future__ import annotations
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
+import sys
 
-import sys, pathlib
-sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))  # ← src 경로 추가
+# local import (assumes this file is under src/dataset)
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 import dataset.generate_truth as gt
 
-# generate_truth.get_param()을 통해 파라미터 가져오기
-params = gt.get_param()
-GRID = params['GRID']
-N_SOURCES_RANGE = params['N_SOURCES_RANGE']
-INTENSITY_RANGE = params['INTENSITY_RANGE']
-SIGMA_RANGE = params['SIGMA_RANGE']
-SEED = params['SEED']
-N_SOURCES = params['N_SOURCES']
+__all__ = [
+    "generate_waypoints", "sparse_from_waypoints", "visualize_sparse"
+]
 
-# ---------------- 하이퍼파라미터 ----------------
-GRID      = 256
-WORLD_M   = 10.0
-PX_PER_M  = GRID / WORLD_M       # ≈ 25.6 px
-STEP_M    = 1.0
-STEP_PX   = STEP_M * PX_PER_M
-MIN_WP, MAX_WP = 10, 100
-TURN_LIMIT_DEG = 120             # ±120°
-rng = np.random.default_rng(None)
-# -----------------------------------------------
+# -------------------- sampling hyper‑parameters --------------------
+GRID            = gt.GRID
+WORLD_M         = 10.0
+PX_PER_M        = GRID / WORLD_M
+STEP_M_RANGE    = (0.4, 1.2)        # 0.4 m–1.2 m travel between samples
+MIN_WP, MAX_WP  = 10, 100
+TURN_LIMIT_DEG  = 120.0
+GAUSSIAN_NOISE  = 0.05              # ±5 % σ noise on measurement values
+POISSON_NOISE   = True
+_rng_global     = np.random.default_rng(None)
+# ------------------------------------------------------------------
 
-def generate_waypoints(grid=GRID, step_px=STEP_PX,
-                       min_pts=MIN_WP, max_pts=MAX_WP,
-                       turn_limit_deg=TURN_LIMIT_DEG,
-                       rng=rng):
+
+def _random_heading(rng: np.random.Generator):
+    return rng.uniform(0.0, 360.0)
+
+
+def _step_in_heading(y: float, x: float, step_px: float, heading_deg: float):
+    rad = np.deg2rad(heading_deg)
+    return y + step_px * np.sin(rad), x + step_px * np.cos(rad)
+
+
+def generate_waypoints(
+    grid: int = GRID,
+    *,
+    min_pts: int = MIN_WP,
+    max_pts: int = MAX_WP,
+    rng: np.random.Generator | None = None,
+):
+    """Generate a *random walk* waypoint list that respects world bounds.
+
+    The step length is sampled uniformly in *STEP_M_RANGE* (converted to pixels)
+    at every iteration to mimic irregular sampling intervals.
+    """
+    rng = rng or _rng_global
     n_pts = int(rng.integers(min_pts, max_pts + 1))
 
-    # 시작 좌표
-    y, x = rng.uniform(0, grid), rng.uniform(0, grid)
-    pts  = [(y, x)]
-
-    # 초기 방향 (0~360° 무작위)
-    heading_deg = rng.uniform(0, 360)
+    # initial pose
+    y, x = rng.uniform(0.0, grid), rng.uniform(0.0, grid)
+    heading_deg = _random_heading(rng)
+    pts: list[tuple[int, int]] = [(round(y), round(x))]  # Ensure consistent tuple structure
 
     for _ in range(n_pts - 1):
-        # 새 방향 = 현재 heading ± random_offset(−120°~+120°)
-        offset = rng.uniform(-turn_limit_deg, turn_limit_deg)
-        heading_deg_new = (heading_deg + offset) % 360
-        heading_rad = np.deg2rad(heading_deg_new)
+        # random step length [m] → [px]
+        step_px = rng.uniform(*STEP_M_RANGE) * PX_PER_M
 
-        y_new = y + step_px * np.sin(heading_rad)
-        x_new = x + step_px * np.cos(heading_rad)
+        # sample a turning offset
+        heading_new = (heading_deg + rng.uniform(-TURN_LIMIT_DEG, TURN_LIMIT_DEG)) % 360.0
+        y_new, x_new = _step_in_heading(y, x, step_px, heading_new)
 
-        # 경계 확인, 벗어나면 각도 다시 샘플
+        # boundary check (with 50 retries)
         tries = 0
-        while not (0 <= y_new < grid and 0 <= x_new < grid) and tries < 50:
-            offset = rng.uniform(-turn_limit_deg, turn_limit_deg)
-            heading_deg_new = (heading_deg + offset) % 360
-            heading_rad = np.deg2rad(heading_deg_new)
-            y_new = y + step_px * np.sin(heading_rad)
-            x_new = x + step_px * np.cos(heading_rad)
+        while not (0.0 <= y_new < grid and 0.0 <= x_new < grid) and tries < 50:
+            heading_new = (heading_deg + rng.uniform(-TURN_LIMIT_DEG, TURN_LIMIT_DEG)) % 360.0
+            y_new, x_new = _step_in_heading(y, x, step_px, heading_new)
             tries += 1
-        if tries == 50:   # 더 이상 유효한 방향 못 찾으면 종료
-            break
+        if tries == 50:
+            break  # give up if no valid direction
 
-        # 다음 스텝 확정
-        pts.append((y_new, x_new))
+        pts.append((round(y_new), round(x_new)))
         y, x = y_new, x_new
-        heading_deg = heading_deg_new
+        heading_deg = heading_new
 
-    pts_int = np.round(pts).astype(int)
-    pts_int = np.clip(pts_int, 0, grid-1)   # y,x 모두 클립
-    return pts_int
+    return np.clip(np.asarray(pts, dtype=int), 0, grid - 1)
 
-# -------------------------------------------------
-# 1) sparse_from_waypoints
-# -------------------------------------------------
-def sparse_from_waypoints(field: np.ndarray,
-                          waypoints: np.ndarray):
+
+# ------------------------------------------------------------------
+# sparse measurement generation
+# ------------------------------------------------------------------
+
+def sparse_from_waypoints(
+    field: np.ndarray,
+    waypoints: np.ndarray,
+    *,
+    gaussian_noise_sigma: float = GAUSSIAN_NOISE,
+    poisson_noise: bool = POISSON_NOISE,
+    rng: np.random.Generator | None = None,
+):
+    """Return (measurement, mask) arrays of *field* given *waypoints*.
+
+    Adds sensor noise: multiplicative Gaussian ±σ and optional Poisson.
     """
-    field      : (H, W) 정답 방사선 필드
-    waypoints  : (N, 2) int  배열  (row=y, col=x)
-    
-    반환
-      r_meas : waypoint 위치에만 실제 값, 나머지 0
-      mask   : waypoint 위치 1, 나머지 0
-    """
+    rng = rng or _rng_global
     r_meas = np.zeros_like(field, dtype=np.float32)
     mask   = np.zeros_like(field, dtype=np.uint8)
 
-    # waypoint 좌표마다 값 할당
     for y, x in waypoints:
-        r_meas[y, x] = field[y, x]
-        mask[y, x]   = 1
+        val = field[y, x]
+        # multiplicative Gaussian noise (5 % default)
+        if gaussian_noise_sigma > 0:
+            val *= rng.normal(loc=1.0, scale=gaussian_noise_sigma)
+        # Poisson noise (~counting statistics)
+        if poisson_noise and val > 0:
+            val = rng.poisson(val)
+        r_meas[y, x] = val
+        mask[y, x] = 1
     return r_meas, mask
 
 
-# -------------------------------------------------
-# 2) visualize_sparse
-# -------------------------------------------------
-def visualize_sparse(field: np.ndarray,
-                     waypoints: np.ndarray,
-                     r_meas: np.ndarray,
-                     mask: np.ndarray):
-    """
-    두 subplot:
-      (A) 정답 필드 + 경로(선)
-      (B) sparse 측정 시각화
-    """
+# ------------------------------------------------------------------
+# visual helper (unchanged API)
+# ------------------------------------------------------------------
+
+def visualize_sparse(field: np.ndarray, waypoints: np.ndarray, r_meas: np.ndarray, mask: np.ndarray):
+    """Plot ground‑truth + trajectory and corresponding sparse map."""
     fig, ax = plt.subplots(1, 2, figsize=(11, 5), dpi=110)
 
-    # (A) Ground-truth + Trajectory
-    ax[0].imshow(field, cmap='hot', origin='lower')
-    ax[0].plot(waypoints[:, 1], waypoints[:, 0],
-               '-o', c='lime', lw=1.3, ms=3, label='Path')
-    ax[0].set_title("Ground-truth Field & Trajectory")
+    # (A) ground‑truth
+    ax[0].imshow(field, cmap="hot", origin="lower")
+    ax[0].plot(waypoints[:, 1], waypoints[:, 0], "-o", c="lime", lw=1.3, ms=3, label="Path")
+    ax[0].set_title("Ground‑truth & Trajectory")
     ax[0].legend(frameon=False)
-    ax[0].axis('off')
+    ax[0].axis("off")
 
-    # (B) Sparse 측정 표시
-    background = np.ma.masked_where(mask, field)      # waypoint 제외 배경
-    sparse_vis = np.ma.masked_where(mask == 0, r_meas)
-
-    im = ax[1].imshow(r_meas, cmap='hot', origin='lower')    
-    ax[1].plot(waypoints[:, 1], waypoints[:, 0],
-               c='white', lw=0.6, alpha=0.35)          # 얇은 경로
+    # (B) sparse measurement
+    im = ax[1].imshow(r_meas, cmap="hot", origin="lower")
+    ax[1].plot(waypoints[:, 1], waypoints[:, 0], c="white", lw=0.6, alpha=0.35)
     ax[1].set_title(f"Sparse Measurements ({mask.sum()} pts)")
-    ax[1].axis('off')
-    plt.colorbar(im, ax=ax[1], fraction=0.046, pad=0.03,
-                 label='Measured intensity')
-
+    ax[1].axis("off")
+    plt.colorbar(im, ax=ax[1], fraction=0.046, pad=0.04)
     plt.tight_layout()
     plt.show()
 
+# sanity‑check when run directly
 if __name__ == "__main__":
-    # --- 단일 샘플 생성 ---
-    coords, amps, sigmas = gt.sample_sources(GRID, N_SOURCES)
-    field = gt.gaussian_field(GRID, coords, amps, sigmas)
-    # ---------- 예시 실행 ----------
-    # waypoint 생성
+    n_src = _rng_global.integers(gt.N_SOURCES_RANGE[0], gt.N_SOURCES_RANGE[1] + 1)
+    c, a, s = gt.sample_sources(GRID, n_src)
+    field = gt.gaussian_field(GRID, c, a, s)
     wps = generate_waypoints()
     r_meas, mask = sparse_from_waypoints(field, wps)
     visualize_sparse(field, wps, r_meas, mask)

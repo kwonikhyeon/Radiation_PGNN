@@ -1,118 +1,117 @@
-# src/dataset/dataset_generator.py
-import os
+from __future__ import annotations
+import sys
 from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-import sys, pathlib
-sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))  # ← src 경로 추가
-
+# ---------------- local imports ----------------
+sys.path.append(str(Path(__file__).resolve().parents[1]))  # add src/ to PYTHONPATH
 import dataset.generate_truth as gt
 import dataset.trajectory_sampler as ts
+# ------------------------------------------------
+
+__all__ = ["generate_dataset", "RadiationDataset"]
+
+# ---------------------- paths -------------------
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+# ------------------------------------------------
+
+# --------------- constants & helpers ------------
+_rng_global = np.random.default_rng(None)
 
 
-# ──────────────────────────────────────────────────────────
-# 0. 출력 루트 디렉터리 정의  (…/data/synthetic)
-# ──────────────────────────────────────────────────────────
-ROOT_DIR  = Path(__file__).resolve().parents[2]     # 프로젝트 루트
-DATA_DIR  = ROOT_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)         # 없으면 생성
+def _precompute_coord(grid: int):
+    """Return (2,H,W) array with normalized X,Y in [-1,1]."""
+    ys, xs = np.meshgrid(np.arange(grid), np.arange(grid), indexing="ij")
+    ys = (ys / (grid - 1) * 2 - 1).astype(np.float32)
+    xs = (xs / (grid - 1) * 2 - 1).astype(np.float32)
+    return np.stack([ys, xs], axis=0)  # (2,H,W)
+
+_COORD = _precompute_coord(gt.GRID)  # global cache
 
 
-# ──────────────────────────────────────────────────────────
-# 1. 단일 샘플 생성
-# ──────────────────────────────────────────────────────────
-# def make_sample(rng: np.random.Generator):
-#     rng = rng or np.random.default_rng()
+# ---------------- single‑sample synthesis ----------------
 
-#     n_src = int(rng.integers(gt.N_SOURCES_RANGE[0],
-#                              gt.N_SOURCES_RANGE[1] + 1))
-#     coords, amps, sigmas = gt.sample_sources(gt.GRID, n_src)
-#     field = gt.gaussian_field(gt.GRID, coords, amps, sigmas).astype(np.float32)
+def _make_single_sample(rng: np.random.Generator):
+    """Return (gt_field, meas, mask) all (H,W)."""
+    n_src = int(rng.integers(gt.N_SOURCES_RANGE[0], gt.N_SOURCES_RANGE[1] + 1))
+    c, a, s = gt.sample_sources(gt.GRID, n_src, rng=rng)
+    field = gt.gaussian_field(gt.GRID, c, a, s)
 
-#     waypoints      = ts.generate_waypoints()
-#     r_meas, mask   = ts.sparse_from_waypoints(field, waypoints)
-#     return field, r_meas.astype(np.float32), mask.astype(np.uint8)
+    # ★ 음수 값 방지: field 값을 0으로 클리핑
+    field = np.clip(field, 0, None)
+    field /= 100.0  # ★ 전역 최대치(여유로 120)로 나눔
 
-def make_sample(rng: np.random.Generator | None = None):
-    rng = rng or np.random.default_rng()
+    waypoints = ts.generate_waypoints(rng=rng)
+    meas, mask = ts.sparse_from_waypoints(field, waypoints, rng=rng)
 
-    # 1) Ground-truth 필드 생성 (256×256)
-    n_src = int(rng.integers(gt.N_SOURCES_RANGE[0],
-                             gt.N_SOURCES_RANGE[1] + 1))
-    coords, amps, sigmas = gt.sample_sources(gt.GRID, n_src)
-    field = gt.gaussian_field(gt.GRID, coords, amps, sigmas).astype(np.float32)
+    # ★ 음수 값 방지: meas 값을 0으로 클리핑
+    meas = np.clip(meas, 0, None)
 
-    # 2) 0-to-1 정규화 (★ 추가)
-    f_max = field.max() + 1e-6          # 0 방지용 ε
-    field /= f_max
+    # 로그 계산 시 음수 방지
+    logM = np.log1p(meas)
 
-    # 3) sparse 측정치 추출 → r_meas / mask
-    waypoints = ts.generate_waypoints()
-    r_meas, mask = ts.sparse_from_waypoints(field, waypoints)
-    r_meas = r_meas.astype(np.float32)     # 같은 스케일
-    mask   = mask.astype(np.uint8)
-
-    return field, r_meas, mask                      # 모두 (H,W)
+    # 입력 데이터 생성
+    inp = np.stack([meas, mask, logM, *_COORD], axis=0)  # (5,H,W)
+    return field, inp, mask.astype(np.float32)
 
 
-# ──────────────────────────────────────────────────────────
-# 2. 데이터셋 생성 & 저장
-# ──────────────────────────────────────────────────────────
-def generate_dataset(num_samples: int,
-                     split: str):
-    """
-    Parameters
-    ----------
-    num_samples : 저장할 샘플 수
-    split       : 'train' | 'val' | 'test' …  (파일 이름에 사용)
-    seed        : 난수 시드를 지정하면 재현 가능
-    """
-    rng = np.random.default_rng(None)
-    truth_list, meas_list, mask_list = [], [], []
+# ---------------- dataset generator API --------
+
+def generate_dataset(num_samples: int, split: str):
+    """Generate *num_samples* samples and save to data/{split}.npz."""
+    inp_list, gt_list = [], []
 
     for _ in range(num_samples):
-        field, r_meas, mask = make_sample(rng)
-        truth_list.append(field)
-        meas_list.append(r_meas)
-        mask_list.append(mask)
+        gt_field, inp, mask = _make_single_sample(_rng_global)
+        inp_list.append(inp)
+        gt_list.append(gt_field[None])  # (1,H,W)
 
     out_path = DATA_DIR / f"{split}.npz"
-    np.savez_compressed(
-        out_path,
-        truth=np.stack(truth_list),       # (N,H,W)
-        r_meas=np.stack(meas_list),
-        mask=np.stack(mask_list)
-    )
-    print(f"[✓] {split} ({num_samples}) → {out_path.relative_to(ROOT_DIR)}")
+    np.savez_compressed(out_path,
+                        inp=np.stack(inp_list, axis=0),  # (N,5,H,W)
+                        gt=np.stack(gt_list, axis=0))   # (N,1,H,W)
+    print(f"[✓] Saved {split}: {num_samples} samples → {out_path.relative_to(ROOT_DIR)}")
 
 
-# ──────────────────────────────────────────────────────────
-# 3. PyTorch Dataset (선택 사항)
-# ──────────────────────────────────────────────────────────
+# --------------------- torch Dataset ------------
 class RadiationDataset(Dataset):
-    def __init__(self, split: str):
-        cache = np.load(DATA_DIR / f"{split}.npz")
-        self.truth, self.r_meas, self.mask = \
-            cache["truth"], cache["r_meas"], cache["mask"]
+    """Loads pre‑generated {split}.npz and yields (inp, gt)."""
 
-    def __len__(self): return len(self.truth)
+    def __init__(self, split: str):
+        p = DATA_DIR / f"{split}.npz"
+        if not p.exists():
+            raise FileNotFoundError(f"{p} not found. Run generate_dataset() first.")
+        cache = np.load(p)
+        self.inp = cache["inp"].astype(np.float32)
+        self.gt  = cache["gt" ].astype(np.float32)
+
+    def __len__(self):
+        return len(self.inp)
 
     def __getitem__(self, idx):
-        x = np.stack([self.r_meas[idx], self.mask[idx]], 0)   # (2,H,W)
-        y = self.truth[idx]                                   # (H,W)
-        return torch.from_numpy(x), torch.from_numpy(y)
+        return ( torch.from_numpy(self.inp[idx]),
+                 torch.from_numpy(self.gt[idx]) )
 
 
-# ──────────────────────────────────────────────────────────
-# 4. 직접 실행 예시
-# ──────────────────────────────────────────────────────────
+# --------------------- CLI test ------------------
 if __name__ == "__main__":
-    generate_dataset(num_samples= 9000, split="train")
-    generate_dataset(num_samples= 1000, split="val")
-    generate_dataset(num_samples= 200, split="test")
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n_train", type=int, default=1800)
+    ap.add_argument("--n_val",   type=int, default=200)
+    ap.add_argument("--n_test",   type=int, default=200)
+    args = ap.parse_args()
 
-    # DataLoader 사용법
-    # train_loader = DataLoader(RadiationDataset("train"),
-    #                           batch_size=8, shuffle=True)
+    generate_dataset(args.n_train, "train")
+    generate_dataset(args.n_val,   "val")
+    generate_dataset(args.n_test,   "test")
+
+    # quick sanity check
+    ds = RadiationDataset("train")
+    loader = DataLoader(ds, batch_size=4, shuffle=True)
+    x, y = next(iter(loader))
+    print("Batch shapes:", x.shape, y.shape)
