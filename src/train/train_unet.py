@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))            # …/src
-from model.unet_pgnn import PGNN_UNet, laplacian_loss
+from model.unet_deep_pgnn import PGNN_UNet, laplacian_loss
 
 # -------------------------------------------------------------
 # Dataset wrapper for .npz files
@@ -29,7 +29,7 @@ class RadFieldDataset(Dataset):
             self.inp = self.data["inp"].astype(np.float32)
         else:                                        # 개별 채널 → stack
             chans = [self.data[k].astype(np.float32)
-                      for k in ["M", "mask", "logM", "X", "Y"]]
+                      for k in ["M", "mask", "logM", "X", "Y", "distance"]]
             self.inp = np.stack(chans, axis=1)       # (N,5,H,W)
         self.gt  = self.data["gt"].astype(np.float32)  # (N,1,H,W)
         self.names = [f"{npz_path.stem}_{i}" for i in range(len(self.inp))]
@@ -61,39 +61,38 @@ def ssim(pred, gt):
 # -------------------------------------------------------------
 
 def train_one_epoch(model, loader, opt, epoch, cfg):
-    """
-    loss =  MSE(mask)                    ⟵ 계측값 복원
-          + α · MSE(full)               ⟵ 미계측 영역도 살짝 학습
-          + λ_pg(epoch) · Laplacian      ⟵ 물리 평활 제약
-    """
     model.train()
     total = 0.0
     for inp, gt, _ in tqdm(loader, desc=f"Train {epoch}"):
         inp, gt = inp.to(cfg.device), gt.to(cfg.device)
-        mask = inp[:, 1:2]
+        mask = inp[:, 1:2]          # measured 위치
+        dist = inp[:, 5:6]          # distance_map (정규화된 거리)
 
-        pred = model(inp)
+        # 모델 예측
+        pred_raw = model(inp)
 
-        # (1) 데이터 손실
-        mse_mask = F.mse_loss(pred * mask, gt * mask)
-        mse_full = F.mse_loss(pred, gt)
+        # (1) 출력 마스킹: 측정된 위치는 gt 그대로 사용
+        pred = pred_raw * (1 - mask) + gt * mask
 
-        # (2) Laplacian PG loss
+        # (2) 거리 기반 soft attention weight (가까울수록 weight 높음)
+        weight = torch.exp(-3.0 * dist)
+
+        # (3) 손실 함수 (측정 위치는 약하게, 미측정은 정상 weight)
+        loss_unmeasured = F.mse_loss(pred * (1 - mask) * weight, gt * (1 - mask) * weight)
+        loss_measured   = F.mse_loss(pred_raw * mask, gt * mask)
+
+        # (4) PGNN smooth loss
         lap = laplacian_loss(pred)
-
-        # (3) 가중치 스케줄
         λ_pg = min(1.0, epoch / cfg.pg_warmup) * cfg.pg_weight
 
-        # (4) 총합
-        loss = mse_mask + cfg.alpha_unmask * mse_full + λ_pg * lap
+        # (5) 총 손실
+        loss = loss_unmeasured + 0.1 * loss_measured + cfg.alpha_unmask * F.mse_loss(pred, gt) + λ_pg * lap
 
-        # (5) 최적화
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
 
         total += loss.item() * inp.size(0)
-
     return total / len(loader.dataset)
 
 
@@ -118,9 +117,9 @@ def eval_epoch(model, loader, cfg):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir", type=Path, default=Path("./data"))
-    p.add_argument("--save_dir", type=Path, default=Path("./checkpoints/unet_exp1"))
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--save_dir", type=Path, default=Path("./checkpoints/unet_exp6"))
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--pg_weight", type=float, default=0.1)
     p.add_argument("--pg_warmup", type=int, default=10)

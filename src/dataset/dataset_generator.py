@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from scipy.ndimage import distance_transform_edt
 
 # ---------------- local imports ----------------
 sys.path.append(str(Path(__file__).resolve().parents[1]))  # add src/ to PYTHONPATH
@@ -36,26 +37,56 @@ _COORD = _precompute_coord(gt.GRID)  # global cache
 # ---------------- single‑sample synthesis ----------------
 
 def _make_single_sample(rng: np.random.Generator):
-    """Return (gt_field, meas, mask) all (H,W)."""
+    """Return (gt_field, inp, mask) all (H,W).
+    
+    FIXED: Ensures data consistency between measured values and ground truth.
+    """
     n_src = int(rng.integers(gt.N_SOURCES_RANGE[0], gt.N_SOURCES_RANGE[1] + 1))
     c, a, s = gt.sample_sources(gt.GRID, n_src, rng=rng)
     field = gt.gaussian_field(gt.GRID, c, a, s)
 
-    # ★ 음수 값 방지: field 값을 0으로 클리핑
+    # FIXED: Improved normalization strategy
+    # Ensure non-negative values
     field = np.clip(field, 0, None)
-    field /= 100.0  # ★ 전역 최대치(여유로 120)로 나눔
+    
+    # FIXED: More conservative normalization to prevent extreme scaling
+    # Use the 99th percentile instead of max to handle outliers
+    field_99th = np.percentile(field[field > 0], 99) if np.any(field > 0) else 1.0
+    normalization_factor = max(field_99th, 1.0)  # Ensure we don't divide by tiny numbers
+    field = field / normalization_factor
+    
+    # Ensure the field stays in reasonable range [0, 1]
+    field = np.clip(field, 0, 1.0)
 
+    # Generate waypoints and measurements
     waypoints = ts.generate_waypoints(rng=rng)
     meas, mask = ts.sparse_from_waypoints(field, waypoints, rng=rng)
 
-    # ★ 음수 값 방지: meas 값을 0으로 클리핑
-    meas = np.clip(meas, 0, None)
+    # FIXED: No additional clipping needed since sparse_from_waypoints now handles this correctly
+    # The measured values should now match the field values at measured positions
+    
+    # Verify data consistency (optional check)
+    measured_positions = np.where(mask > 0)
+    if len(measured_positions[0]) > 0:
+        # Sample a few points to verify consistency
+        for i in range(min(3, len(measured_positions[0]))):
+            y, x = measured_positions[0][i], measured_positions[1][i]
+            field_val = field[y, x]
+            meas_val = meas[y, x]
+            if abs(field_val - meas_val) > 1e-6:
+                print(f"Warning: Data inconsistency at ({y},{x}): field={field_val:.6f}, meas={meas_val:.6f}")
 
-    # 로그 계산 시 음수 방지
+    # Log calculation with proper handling
     logM = np.log1p(meas)
 
-    # 입력 데이터 생성
-    inp = np.stack([meas, mask, logM, *_COORD], axis=0)  # (5,H,W)
+    # Distance map: measured positions = 0, others = normalized distance
+    raw_dist = distance_transform_edt(1 - mask).astype(np.float32)
+    raw_dist[mask == 1] = 0.0
+    distance_map = raw_dist / (gt.GRID + 1e-6)  # avoid div by 0
+
+    # Stack input channels: [meas, mask, logM, coordY, coordX, distance]
+    inp = np.stack([meas, mask, logM, *_COORD, distance_map], axis=0)  # (6,H,W)
+    
     return field, inp, mask.astype(np.float32)
 
 
@@ -101,9 +132,9 @@ class RadiationDataset(Dataset):
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n_train", type=int, default=1800)
-    ap.add_argument("--n_val",   type=int, default=200)
-    ap.add_argument("--n_test",   type=int, default=200)
+    ap.add_argument("--n_train", type=int, default=9000)
+    ap.add_argument("--n_val",   type=int, default=1000)
+    ap.add_argument("--n_test",   type=int, default=100)
     args = ap.parse_args()
 
     generate_dataset(args.n_train, "train")

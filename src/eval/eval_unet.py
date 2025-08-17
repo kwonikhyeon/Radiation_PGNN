@@ -22,7 +22,7 @@ from scipy.ndimage import binary_dilation  # 추가
 # ------------------------- model ------------------------------
 ROOT = pathlib.Path(__file__).resolve().parents[1]  # …/src
 sys.path.append(str(ROOT))
-from model.unet_pgnn import PGNN_UNet
+from model.unet_deep_pgnn import PGNN_UNet
 # --------------------------------------------------------------
 
 # --------------------- Dataset wrapper -----------------------
@@ -50,9 +50,9 @@ def ssim(pred, gt):
 # --------------------------- main -----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt",      type=Path, default="./checkpoints/unet_exp1/ckpt_best.pth", help=".pth checkpoint")
+    ap.add_argument("--ckpt",      type=Path, default="./checkpoints/unet_exp6/ckpt_best.pth", help=".pth checkpoint")
     ap.add_argument("--data_file", type=Path, default="./data/test.npz", help="dataset .npz")
-    ap.add_argument("--out_dir",   type=Path, default="./eval_vis", help="output directory")
+    ap.add_argument("--out_dir",   type=Path, default="./eval_vis/exp6", help="output directory")
     ap.add_argument("--batch",     type=int, default=4)
     args = ap.parse_args()
 
@@ -88,15 +88,16 @@ def main():
                         axes,
                         [sparse, p[0].numpy(), g[0].numpy()],
                         ["Input: Sparse", "Prediction", "Ground-truth"]):
-                    im = ax.imshow(img, cmap="hot", origin="lower")
+                    # vmin=0, vmax=1로 모든 데이터 동일한 기준으로 시각화
+                    im = ax.imshow(img, cmap="hot", origin="lower", vmin=0, vmax=1)
                     ax.set_title(ttl, fontsize=10)
                     ax.axis("off")
                     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-                    # 계측 위치에 점 찍기
+                    # 계측 위치에 점 찍기 (모든 패널에 오버레이)
+                    y_coords, x_coords = np.where(mask > 0)
+                    ax.scatter(x_coords, y_coords, c="blue", s=10, label="Measured Points")
                     if ttl == "Input: Sparse":
-                        y_coords, x_coords = np.where(mask > 0)
-                        ax.scatter(x_coords, y_coords, c="blue", s=10, label="Measured Points")
                         ax.legend(loc="upper right", fontsize=8)
 
                 plt.tight_layout()
