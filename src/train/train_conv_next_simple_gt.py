@@ -16,12 +16,12 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 # 경로 설정
-ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT))  
 
 # 단순화된 모델 임포트
 try:
-    from simplified_conv_next_pgnn import (
+    from model.simplified_conv_next_pgnn import (
         SimplifiedConvNeXtPGNN,
         simplified_laplacian_loss,
         simplified_physics_loss
@@ -94,25 +94,18 @@ def train_one_epoch_simple_gt(model, loader, optimizer, epoch, cfg):
         
         loss_all = F.mse_loss(pred, gt)
         
-        # 2. MEASUREMENT CONSTRAINT LOSS (강화된 측정값 보존)
+        # 2. MEASUREMENT CONSTRAINT LOSS (간소화됨 - 직접 보존으로 인해)
         mask_float = mask.float()
         measured_values = inp[:, 0:1]
         
-        # A. 기본 측정값 제약
-        measurement_loss = F.mse_loss(pred * mask_float, measured_values * mask_float)
+        # 🔥 핵심 변경: 측정값 직접 보존으로 인해 측정점 손실 대폭 간소화
+        # 측정점에서는 이미 정확한 값이 보존되므로 별도 제약 불필요
         
-        # B. 측정값 스파이크 억제 (주변과의 급격한 차이 방지)
-        if mask_float.sum() > 0:
-            # 측정 위치 주변의 그래디언트 분석
-            kernel = torch.ones(1, 1, 3, 3, device=cfg.device) / 9.0  # 3x3 평균 필터
-            pred_smooth = F.conv2d(pred, kernel, padding=1)
-            measured_pred = pred * mask_float
-            measured_smooth = pred_smooth * mask_float
-            
-            # 측정 위치에서 과도한 스파이크 억제
-            spike_penalty = F.relu(measured_pred - measured_smooth - 0.2).mean()  # 0.2 임계값
-        else:
-            spike_penalty = torch.tensor(0.0, device=cfg.device)
+        # A. 측정점 보존 확인 (디버깅용, 실제로는 항상 0이어야 함)
+        measurement_preservation_check = F.mse_loss(pred * mask_float, measured_values * mask_float)
+        
+        # B. 측정값 스파이크 억제 손실 제거 (직접 보존으로 해결됨)
+        spike_penalty = torch.tensor(0.0, device=cfg.device)
         
         # 3. PHYSICS LOSS: Laplacian smoothness (점진적 적용) - 단순화된 버전 사용
         if epoch >= 5:
@@ -192,11 +185,11 @@ def train_one_epoch_simple_gt(model, loader, optimizer, epoch, cfg):
                         far_mask = (distances > 3.0).float()
                         gaussian_loss += F.mse_loss(pred_decay * far_mask, gt_decay * far_mask) / B
         
-        # 6. 강도 제한 손실 (과도한 예측 방지)
+        # 6. 강도 제한 손실 (정규화된 범위 준수)
         intensity_limit_loss = torch.tensor(0.0, device=cfg.device)
         if epoch >= 5:
-            # 전체 필드에서 과도한 강도 억제
-            intensity_penalty = F.relu(pred - 1.5).mean()  # 1.5 이상 억제
+            # GT가 [0,1] 정규화되어 있으므로 예측도 동일 범위로 제한
+            intensity_penalty = F.relu(pred - 1.0).mean()  # 1.0 이상 억제 (1.5→1.0)
             
             # 피크 주변이 아닌 곳에서 강한 예측 억제
             for b in range(gt.shape[0]):
@@ -217,18 +210,18 @@ def train_one_epoch_simple_gt(model, loader, optimizer, epoch, cfg):
                     
                     # 피크에서 멀리 떨어진 곳 (거리 > 20)에서 강한 예측 억제
                     far_region = (distances > 20.0).float()
-                    intensity_limit_loss += F.relu(pred_b * far_region - 0.1).mean() / gt.shape[0]
+                    intensity_limit_loss += F.relu(pred_b * far_region - 0.05).mean() / gt.shape[0]  # 0.1→0.05
         
-        # 7. TOTAL LOSS (개선된 Simple + GT-Physics)
+        # 7. TOTAL LOSS (직접 측정값 보존 버전 - 대폭 간소화)
         loss = (
-            2.0 * loss_unmeasured +                    # 주요 재구성
-            0.3 * loss_all +                           # 전체 재구성  
-            500.0 * measurement_loss +                 # 측정값 제약 (감소: 1000→500)
-            100.0 * spike_penalty +                    # 측정값 스파이크 억제 (신규)
-            lambda_pg * lap_loss +                     # 라플라시안 (점진적)
-            lambda_gt_physics * gt_physics_loss +      # GT-Physics (점진적)
-            0.2 * gaussian_loss +                      # 가우시안 형태 제약 (신규)
-            0.5 * intensity_limit_loss                 # 강도 제한 (신규)
+            3.0 * loss_unmeasured +                           # 주요 재구성 (증가: 2.0→3.0)
+            0.5 * loss_all +                                  # 전체 재구성 (증가: 0.3→0.5)
+            10.0 * measurement_preservation_check +           # 측정값 보존 확인 (대폭 감소: 500→10)
+            0.0 * spike_penalty +                             # 스파이크 억제 제거 (100→0)
+            lambda_pg * lap_loss +                            # 라플라시안 (점진적)
+            lambda_gt_physics * gt_physics_loss +             # GT-Physics (점진적)
+            0.3 * gaussian_loss +                             # 가우시안 형태 제약 (증가: 0.2→0.3)
+            0.7 * intensity_limit_loss                        # 강도 제한 (증가: 0.5→0.7)
         )
         
         # 안전 장치
@@ -295,12 +288,12 @@ class SimpleGTTrainConfig:
         self.gt_physics_warmup = kwargs.get('gt_physics_warmup', 20)
         
         # 물리 파라미터
-        self.background_level = kwargs.get('background_level', 0.005)
-        self.air_attenuation = kwargs.get('air_attenuation', 0.03)
+        self.background_level = kwargs.get('background_level', 0.0)
+        self.air_attenuation = kwargs.get('air_attenuation', 0.01)
         
         # 경로
         self.data_dir = Path(kwargs.get('data_dir', 'data'))
-        self.save_dir = Path(kwargs.get('save_dir', 'checkpoints/convnext_simple_gt_exp4'))
+        self.save_dir = Path(kwargs.get('save_dir', 'checkpoints/convnext_simple_gt_exp_00'))
         
         # 디바이스
         self.device = kwargs.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
@@ -308,8 +301,8 @@ class SimpleGTTrainConfig:
 def main():
     parser = argparse.ArgumentParser(description="ConvNeXt PGNN - Simple + GT-Physics")
     parser.add_argument("--data_dir", type=str, default="data")
-    parser.add_argument("--save_dir", type=str, default="checkpoints/convnext_simple_gt_exp4")
-    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--save_dir", type=str, default="checkpoints/convnext_simple_gt_exp7")
+    parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--pred_scale", type=float, default=1.0)
@@ -317,9 +310,9 @@ def main():
     # GT-Physics 전용 옵션
     parser.add_argument("--use_gt_physics", action='store_true', default=True, 
                        help="Enable GT-based physics loss")
-    parser.add_argument("--gt_physics_weight", type=float, default=0.1,
+    parser.add_argument("--gt_physics_weight", type=float, default=0.2,
                        help="GT-Physics loss weight")
-    parser.add_argument("--gt_physics_start_epoch", type=int, default=15,
+    parser.add_argument("--gt_physics_start_epoch", type=int, default=20,
                        help="Epoch to start GT-Physics loss")
     
     args = parser.parse_args()

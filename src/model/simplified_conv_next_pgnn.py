@@ -157,11 +157,14 @@ class SimplifiedConvNeXtPGNN(nn.Module):
         # 간단한 스케일링
         scale_factor = 0.5 + 1.5 * torch.sigmoid(self.adaptive_scale * measured_max)
         
-        # 기본 예측
+        # 기본 예측 (unmeasured 영역만)
         pred_base = F.softplus(main_pred) * scale_factor * self.pred_scale
         
-        # 핵심 3가지 suppression만 적용
-        final_pred = self.apply_core_suppression(pred_base, confidence, distance_map, mask, measured_values)
+        # 핵심 3가지 suppression만 적용 (unmeasured 영역만)
+        pred_suppressed = self.apply_core_suppression(pred_base, confidence, distance_map, mask, measured_values)
+        
+        # 🔥 핵심: 측정값 직접 보존 (스파이크 문제 완전 해결)
+        final_pred = self.preserve_measured_values(pred_suppressed, mask, measured_values)
         
         return final_pred
 
@@ -181,11 +184,55 @@ class SimplifiedConvNeXtPGNN(nn.Module):
         suppression = distance_suppression * confidence_modulation * measurement_preservation
         pred_suppressed = pred * suppression
         
-        # 강도 제한 (간단한 클리핑)
-        max_intensity = measured_values.max() * 2.0  # 2배 제한
-        pred_final = torch.clamp(pred_suppressed, max=max_intensity)
+        # 강도 제한 (정규화된 범위 준수)
+        # GT가 [0,1] 정규화된 범위이므로 예측도 동일 범위로 제한
+        max_intensity = 1.0  # 정규화된 최대값
+        pred_final = torch.clamp(pred_suppressed, min=0.0, max=max_intensity)
         
         return pred_final
+
+    def preserve_measured_values(self, pred, mask, measured_values):
+        """
+        🔥 핵심: 측정값 직접 보존으로 스파이크 아티팩트 완전 제거
+        
+        Args:
+            pred: 모델 예측값 [B, 1, H, W]
+            mask: 측정 마스크 [B, 1, H, W]
+            measured_values: 실제 측정값 [B, 1, H, W]
+        
+        Returns:
+            final_pred: 측정점에서 실제값 보존된 최종 예측 [B, 1, H, W]
+        """
+        # 측정점(mask=1)에서는 예측값 대신 실제 측정값 직접 사용
+        # 비측정점(mask=0)에서는 모델 예측값 사용
+        final_pred = pred * (1 - mask) + measured_values * mask
+        
+        # 선택적: 측정점 주변 부드러운 전환 (optional smoothing)
+        if hasattr(self, 'enable_measurement_smoothing') and self.enable_measurement_smoothing:
+            final_pred = self._apply_measurement_smoothing(final_pred, pred, mask, measured_values)
+        
+        return final_pred
+    
+    def _apply_measurement_smoothing(self, final_pred, pred, mask, measured_values):
+        """측정점 주변 부드러운 전환 (선택적 기능)"""
+        # 3x3 커널로 측정점 주변 가중 평균
+        kernel = torch.ones(1, 1, 3, 3, device=pred.device) / 9.0
+        
+        # 측정점 주변 영역 식별
+        dilated_mask = F.conv2d(mask, kernel, padding=1)
+        transition_mask = (dilated_mask > 0) & (dilated_mask < 1)  # 경계 영역
+        
+        # 경계 영역에서 가중 평균 적용
+        smoothed_pred = F.conv2d(final_pred, kernel, padding=1)
+        
+        # 경계 영역에만 부드러운 전환 적용
+        final_pred = final_pred * (1 - transition_mask.float()) + \
+                    smoothed_pred * transition_mask.float()
+        
+        # 측정점은 항상 원본값 유지
+        final_pred = final_pred * (1 - mask) + measured_values * mask
+        
+        return final_pred
 
 
 def count_parameters(model):

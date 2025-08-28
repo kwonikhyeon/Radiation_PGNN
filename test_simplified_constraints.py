@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parent
 sys.path.append(str(ROOT))
 
-from simplified_conv_next_pgnn import SimplifiedConvNeXtPGNN
+from model.simplified_conv_next_pgnn import SimplifiedConvNeXtPGNN
 
 # 제약 방법들 정의
 class ConstraintMethod1_HardClip(nn.Module):
