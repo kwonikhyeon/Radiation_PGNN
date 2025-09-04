@@ -1,0 +1,11 @@
+{
+  "config": {
+    "method": "ensemble",
+    "n_samples": 100,
+    "distance_weight": 0.6,
+    "distance_sigma": 40.0,
+    "checkpoint": "checkpoints/convnext_simple_gt_exp7/ckpt_best.pth"
+  },
+  "statistics": [
+    {
+      "mse": 

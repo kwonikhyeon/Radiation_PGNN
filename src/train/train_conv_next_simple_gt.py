@@ -301,8 +301,8 @@ class SimpleGTTrainConfig:
 def main():
     parser = argparse.ArgumentParser(description="ConvNeXt PGNN - Simple + GT-Physics")
     parser.add_argument("--data_dir", type=str, default="data")
-    parser.add_argument("--save_dir", type=str, default="checkpoints/convnext_simple_gt_exp7")
-    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--save_dir", type=str, default="checkpoints/convnext_simple_gt_exp8")
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--pred_scale", type=float, default=1.0)
