@@ -1,0 +1,44 @@
+
+=== 방사선 필드 예측 모델 비교 분석 ===
+
+Model 1: Old-version Model (convnext_gt_physics_exp3)
+Model 2: New-version Model (convnext_simple_gt_exp8)
+
+--- 평가지표 설명 ---
+• SSIM Score (구조적 유사도): 예측된 방사선 필드와 실제 필드 간의 구조적 유사성을 측정 (0~1, 높을수록 좋음)
+• PSNR (신호대잡음비): 예측의 신호 품질을 측정하는 지표 (dB 단위, 높을수록 좋음)
+• Field MAE (필드 평균 절대 오차): 예측값과 실제값 간의 평균 절대 차이 (낮을수록 좋음)
+• Field RMSE (필드 제곱근 평균 제곱 오차): 예측의 공간적 일관성과 변동성을 측정 (낮을수록 좋음)
+• Intensity Ratio (강도 비율): 예측된 최대 강도와 실제 최대 강도의 비율 (1.0에 가까울수록 좋음)
+• Intensity Std (강도 표준편차): 강도 예측의 안정성을 나타내는 지표 (낮을수록 안정적)
+
+--- 기본 성능 지표 ---
+                    Old-version    New-version    차이        우수한 모델
+SSIM Score:         0.4357      0.7142      +0.2785      New-version
+PSNR (dB):          8.88       18.97       +10.09       New-version
+
+--- 상세 지표 비교 ---
+Field MAE (평균):   0.1688     0.0440     -0.1247     New-version
+Field RMSE (변동성):    0.0586      0.0194      -0.0391      New-version
+
+강도 비율 (평균):    2.342      0.997      -1.345      New-version
+강도 안정성 (표준편차):      0.406       0.019       -0.386       New-version
+
+
+--- 품질 분포 ---
+
+우수한 품질:       0.0%        3.0%        +3.0%        New-version
+보통 품질:   19.0%       96.0%       +77.0%       New-version
+낮은 품질:       81.0%        1.0%        -80.0%        New-version
+
+--- 주요 문제점 비교 ---
+
+Old-version Model Issues:
+  • 피크 위치가 10픽셀 이상 벗어남: 94%
+  • 전체 필드 평균 오차가 0.1 이상으로 큼: 93%
+  • 예측 최대값이 실제의 2배 이상으로 과도하게 강함: 92%
+
+New-version Model Issues:
+  • 피크 위치가 10픽셀 이상 벗어남: 97%
+  • 예측 분포의 다양성이 실제보다 낮음 (단순화 부작용 가능성): 12%
+  • 전체 필드 평균 오차가 0.1 이상으로 큼: 1%
