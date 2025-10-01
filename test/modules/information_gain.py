@@ -32,8 +32,8 @@ class InformationGainParameters:
         measurement_decay: float = 0.8,         # Decay factor for measurement influence
         # Gradient parameters
         gradient_threshold: float = 0.2,        # Threshold for selecting gradient prediction
-        gradient_weight: float = 0.3,           # Weight for gradient component in final gain (decreased)
-        uncertainty_weight: float = 0.7,        # Weight for uncertainty component in final gain (increased)
+        gradient_weight: float = 0.6,           # Weight for gradient component in final gain (increased for priority)
+        uncertainty_weight: float = 0.5,        # Weight for uncertainty component in final gain (decreased)
         gradient_sigma: float = 1.5,            # Gaussian sigma for gradient smoothing
         # Measurement exclusion parameters
         measurement_penalty: float = 0.9,       # Penalty factor for measured points (0-1)

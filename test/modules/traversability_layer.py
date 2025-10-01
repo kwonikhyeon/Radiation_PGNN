@@ -108,10 +108,26 @@ class TraversabilityCalculator:
                 - source_locations: List of (y, x) coordinates of detected sources
                 - detection_metadata: Metadata from source detection
         """
-        # Use dedicated source detection module
+        # Use dedicated source detection module with relaxed parameters
+        if self.params.source_detection_params is None:
+            # Create default parameters with lower threshold for better detection
+            try:
+                from .source_detection import SourceDetectionParameters
+            except ImportError:
+                from source_detection import SourceDetectionParameters
+                
+            relaxed_params = SourceDetectionParameters(
+                detection_threshold=0.15,  # Lower threshold
+                peak_prominence=0.05,      # Lower prominence
+                merge_distance=15,         # Smaller merge distance
+                confidence_threshold=0.3   # Lower confidence threshold
+            )
+        else:
+            relaxed_params = self.params.source_detection_params
+            
         detection_result = detect_radiation_sources(
             radiation_field, 
-            parameters=self.params.source_detection_params
+            parameters=relaxed_params
         )
         
         source_locations = detection_result['source_locations']
@@ -231,17 +247,17 @@ class TraversabilityCalculator:
         
         return distances
     
-    def estimate_source_size(self, radiation_field: np.ndarray, 
-                           source_position: Tuple[int, int]) -> float:
+    def estimate_source_extent(self, radiation_field: np.ndarray, 
+                             source_position: Tuple[int, int]) -> Dict[str, Any]:
         """
-        Estimate the effective size of a radiation source based on its spread.
+        Estimate the extent and shape characteristics of a radiation source.
         
         Args:
             radiation_field: (H, W) radiation field
             source_position: (y, x) source center position
             
         Returns:
-            estimated_size: Estimated radius of the source in pixels
+            source_info: Dictionary containing size, boundary points, and angular extent
         """
         source_y, source_x = source_position
         H, W = radiation_field.shape
@@ -249,61 +265,65 @@ class TraversabilityCalculator:
         # Get radiation value at source center
         center_intensity = radiation_field[source_y, source_x]
         
-        # Define intensity thresholds for size estimation
-        high_threshold = center_intensity * 0.7  # 70% of center intensity
-        medium_threshold = center_intensity * 0.5  # 50% of center intensity
-        low_threshold = center_intensity * 0.3   # 30% of center intensity
+        # Define detection threshold (lower threshold to capture more of the source)
+        detection_threshold = max(center_intensity * 0.2, 0.1)
         
-        # Search in expanding circles to find where intensity drops
-        max_radius = min(30, min(H, W) // 4)  # Reasonable maximum radius
+        # Find all pixels above threshold within reasonable distance
+        max_search_radius = min(40, min(H, W) // 3)
         
-        high_radius = 0
-        medium_radius = 0
-        low_radius = 0
+        # Create coordinate grids relative to source
+        y_coords, x_coords = np.ogrid[:H, :W]
+        distances = np.sqrt((y_coords - source_y)**2 + (x_coords - source_x)**2)
         
-        for radius in range(1, max_radius + 1):
-            # Sample points on the circle
-            angles = np.linspace(0, 2*np.pi, max(8, radius * 2), endpoint=False)
-            circle_y = source_y + radius * np.sin(angles)
-            circle_x = source_x + radius * np.cos(angles)
-            
-            # Keep points within bounds
-            valid_mask = ((circle_y >= 0) & (circle_y < H) & 
-                         (circle_x >= 0) & (circle_x < W))
-            
-            if not valid_mask.any():
-                break
-                
-            # Sample intensities at circle points
-            circle_y_int = np.round(circle_y[valid_mask]).astype(int)
-            circle_x_int = np.round(circle_x[valid_mask]).astype(int)
-            circle_intensities = radiation_field[circle_y_int, circle_x_int]
-            
-            mean_intensity = circle_intensities.mean()
-            
-            # Check threshold crossings
-            if mean_intensity >= high_threshold and high_radius == 0:
-                high_radius = radius
-            if mean_intensity >= medium_threshold and medium_radius == 0:
-                medium_radius = radius
-            if mean_intensity >= low_threshold and low_radius == 0:
-                low_radius = radius
+        # Find source boundary points
+        source_mask = ((radiation_field >= detection_threshold) & 
+                      (distances <= max_search_radius))
         
-        # Use medium threshold radius as primary size indicator
-        # Fall back to other thresholds if medium is not found
-        if medium_radius > 0:
-            estimated_size = medium_radius
-        elif high_radius > 0:
-            estimated_size = high_radius * 1.5  # Extrapolate
-        elif low_radius > 0:
-            estimated_size = low_radius * 0.7   # Conservative estimate
+        if not source_mask.any():
+            # Fallback to small default source
+            return {
+                'size': 5.0,
+                'boundary_points': [],
+                'angular_extent': np.pi / 3,  # 60 degrees default
+                'center': source_position
+            }
+        
+        # Find boundary points
+        boundary_y, boundary_x = np.where(source_mask)
+        
+        # Calculate angles from source center to all boundary points
+        rel_y = boundary_y - source_y
+        rel_x = boundary_x - source_x
+        angles = np.arctan2(rel_y, rel_x)
+        boundary_distances = np.sqrt(rel_y**2 + rel_x**2)
+        
+        # Estimate effective size as mean distance to boundary
+        estimated_size = np.mean(boundary_distances)
+        estimated_size = np.clip(estimated_size, 3.0, 30.0)
+        
+        # Calculate angular extent
+        if len(angles) > 1:
+            # Sort angles and find largest gap
+            sorted_angles = np.sort(angles)
+            angle_diffs = np.diff(np.concatenate([sorted_angles, [sorted_angles[0] + 2*np.pi]]))
+            
+            # The source angular extent is 2π minus the largest gap
+            max_gap = np.max(angle_diffs)
+            angular_extent = 2*np.pi - max_gap
+            
+            # Ensure reasonable bounds
+            angular_extent = np.clip(angular_extent, np.pi/6, np.pi)  # 30° to 180°
         else:
-            estimated_size = 5.0  # Default minimum size
+            angular_extent = np.pi / 3  # Default 60°
         
-        # Clamp to reasonable range
-        estimated_size = np.clip(estimated_size, 3.0, 25.0)
-        
-        return estimated_size
+        return {
+            'size': estimated_size,
+            'boundary_points': list(zip(boundary_y, boundary_x)),
+            'angular_extent': angular_extent,
+            'center': source_position,
+            'boundary_angles': angles,
+            'boundary_distances': boundary_distances
+        }
     
     def calculate_adaptive_fan_angle(self, source_size: float) -> float:
         """
@@ -328,6 +348,55 @@ class TraversabilityCalculator:
         
         return adaptive_angle
     
+    def calculate_encompassing_fan_angle(self, radiation_field: np.ndarray,
+                                       source_position: Tuple[int, int],
+                                       robot_position: Tuple[int, int]) -> float:
+        """
+        Calculate fan angle that encompasses the entire predicted source extent.
+        
+        Args:
+            radiation_field: (H, W) radiation field
+            source_position: (y, x) source center position
+            robot_position: (y, x) robot position
+            
+        Returns:
+            fan_angle: Fan angle in radians that covers the source extent
+        """
+        source_info = self.estimate_source_extent(radiation_field, source_position)
+        
+        robot_y, robot_x = robot_position
+        source_y, source_x = source_position
+        
+        # Calculate distance from robot to source center
+        robot_to_source_dist = np.sqrt((robot_y - source_y)**2 + (robot_x - source_x)**2)
+        
+        if robot_to_source_dist < source_info['size']:
+            # Robot is very close to or inside the source - use wide angle
+            return self.params.max_fan_angle
+        
+        # Calculate the angle needed to encompass the source from robot position
+        # Using the source size as the radius and robot distance to calculate subtended angle
+        source_radius = source_info['size']
+        
+        # Calculate the angular width needed to cover the source from robot position
+        # Using trigonometry: tan(half_angle) = source_radius / robot_distance
+        half_angle = np.arctan(source_radius / max(robot_to_source_dist, 1.0))
+        encompassing_angle = 2 * half_angle
+        
+        # Add some margin to ensure full coverage
+        encompassing_angle *= 1.5
+        
+        # Also consider the source's natural angular extent
+        source_angular_extent = source_info.get('angular_extent', np.pi/3)
+        
+        # Take the larger of the two approaches
+        final_angle = max(encompassing_angle, source_angular_extent * 0.8)
+        
+        # Ensure within bounds
+        final_angle = np.clip(final_angle, self.params.min_fan_angle, self.params.max_fan_angle)
+        
+        return final_angle
+    
     def calculate_source_path_weight(self, radiation_field: np.ndarray,
                                    robot_position: Tuple[int, int],
                                    source_position: Tuple[int, int]) -> np.ndarray:
@@ -347,11 +416,15 @@ class TraversabilityCalculator:
         robot_y, robot_x = robot_position
         source_y, source_x = source_position
         
-        # Estimate source size and calculate adaptive fan angle
-        source_size = self.estimate_source_size(radiation_field, source_position)
-        adaptive_fan_angle = self.calculate_adaptive_fan_angle(source_size)
+        # Calculate encompassing fan angle that covers the entire source extent
+        encompassing_fan_angle = self.calculate_encompassing_fan_angle(
+            radiation_field, source_position, robot_position)
         
-        print(f"🎯 Source at ({source_y}, {source_x}): size={source_size:.1f}px, fan_angle={adaptive_fan_angle*180/np.pi:.1f}°")
+        source_info = self.estimate_source_extent(radiation_field, source_position)
+        
+        print(f"🎯 Source at ({source_y}, {source_x}): size={source_info['size']:.1f}px, "
+              f"extent_angle={source_info['angular_extent']*180/np.pi:.1f}°, "
+              f"fan_angle={encompassing_fan_angle*180/np.pi:.1f}°")
         
         # Create coordinate grids
         y_coords, x_coords = np.ogrid[:H, :W]
@@ -377,8 +450,8 @@ class TraversabilityCalculator:
         # Normalize angle difference to [-π, π]
         angle_diff = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
         
-        # Create fan-shaped sector using adaptive angle
-        fan_half_angle = adaptive_fan_angle / 2.0  # Half angle of the adaptive fan
+        # Create fan-shaped sector using encompassing angle
+        fan_half_angle = encompassing_fan_angle / 2.0  # Half angle of the encompassing fan
         within_fan = np.abs(angle_diff) <= fan_half_angle
         
         # Calculate angular weight (higher at center, lower at edges)
@@ -390,12 +463,15 @@ class TraversabilityCalculator:
         distance_weight = np.exp(-pixel_distances * self.params.fan_distance_decay)
         
         # Boost weight near the source itself - scale boost with source size
-        source_boost_sigma = max(self.params.source_boost_sigma, source_size * 0.8)
+        source_boost_sigma = max(self.params.source_boost_sigma, source_info['size'] * 0.8)
         source_boost = np.exp(-((y_coords - source_y)**2 + (x_coords - source_x)**2) / 
                              (2 * source_boost_sigma**2))
         
-        # Combine all weights
-        path_weights = angular_weight * distance_weight + source_boost * 0.3
+        # Combine all weights with more conservative scaling
+        path_weights = angular_weight * distance_weight + source_boost * 0.2  # Reduced from 0.3 to 0.2
+        
+        # Apply conservative upper limit to prevent individual source paths from saturating
+        path_weights = np.clip(path_weights, 0.0, 0.6)  # Cap individual source contributions
         
         return path_weights
     
@@ -454,13 +530,15 @@ class TraversabilityCalculator:
             print(f"📍 Added path to source at ({source_y}, {source_x}), "
                   f"distance: {source_distance:.1f}, weight: {distance_weight:.3f}")
         
-        # Add small baseline to prevent pure zero areas (helps visibility)
-        baseline = 0.05  # Reduced from 0.1 to 0.05
-        combined_weights = combined_weights + baseline
+        # Normalize to prevent saturation - use more conservative approach
+        # Don't add baseline after combining weights to avoid inflating values
+        max_weight = combined_weights.max()
+        if max_weight > 1.0:
+            # Only scale down if values exceed 1.0
+            combined_weights = combined_weights / max_weight
         
-        # Normalize to [0, 1] range
-        if combined_weights.max() > 0:
-            combined_weights = combined_weights / combined_weights.max()
+        # Apply a reasonable upper limit to prevent saturation
+        combined_weights = np.clip(combined_weights, 0.0, 0.8)  # Cap at 0.8 instead of 1.0
         
         print(f"🗺️ Multi-source navigation map created: robot at ({robot_y}, {robot_x}), "
               f"{len(source_locations)} sources processed")
@@ -498,16 +576,14 @@ class TraversabilityCalculator:
                                    (2 * (optimal_exploration_distance * 0.4)**2))  # Narrower spread
         
         # Reduce base exploration intensity to prevent saturation
-        exploration_weights = exploration_weights * 0.4  # Scale down overall intensity (reduced from 0.6)
+        exploration_weights = exploration_weights * 0.3  # Further reduced intensity
         
         # Add smaller randomness for exploration diversity
-        noise = np.random.normal(0, 0.05, (H, W))  # Reduced noise
+        noise = np.random.normal(0, 0.03, (H, W))  # Reduced noise
         exploration_weights += noise
         
-        # Normalize to [0, 1] range
-        exploration_weights = np.clip(exploration_weights, 0, 1)
-        if exploration_weights.max() > 0:
-            exploration_weights = exploration_weights / exploration_weights.max()
+        # Apply conservative clipping instead of normalizing to max
+        exploration_weights = np.clip(exploration_weights, 0, 0.5)  # Cap at 0.5 to prevent saturation
         
         print(f"🔍 Exploration weights generated: optimal distance {optimal_exploration_distance:.1f} pixels")
         
